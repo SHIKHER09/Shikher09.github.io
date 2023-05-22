@@ -336,6 +336,7 @@ border-radius: 30px;
 	width: 100%;
 	height:180px;
 	object-fit: cover;
+	border-bottom: 2px solid #0c0c0c ;
 }
 
 .post-preview{
@@ -434,6 +435,21 @@ border-radius: 30px;
 
 	}
 
+}
+.link a{
+    color: #fff;
+    opacity: 0.5;
+    text-decoration: none;
+    text-transform: capitalize;
+    padding: 10px 30px;
+    margin: 0 20px;
+    line-height: 80px;
+    transition: .5s;
+    font-size: 20px;
+}
+
+.link a:hover, .link.active a{
+    opacity: 1;
 }
 
 
