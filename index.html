@@ -2,7 +2,9 @@
 <html>
 
 <head>
-	<title>Shikher Kumar</title>
+	<title>Shikher Kumar
+		<span id="element"></span>
+	</title>
 
 
 
@@ -18,6 +20,7 @@
 	<link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@500&family=Russo+One&display=swap"
 		rel="stylesheet">
 
+	<script src="https://unpkg.com/typed.js@2.0.16/dist/typed.umd.js"></script>
 	<link rel="stylesheet" type="text/css" href="default.css">
 	<link id="theme-style" rel="stylesheet" type="text/css" href="">
 </head>
@@ -27,7 +30,8 @@
 	<section class="s1">
 		<div class="main-container">
 			<div class="greeting-wrapper">
-				<h1>Hi, I'm Shikher Kumar </h1>
+				<h1>Hi, I'm Shikher Kumar <span id="element"></span></h1>
+
 			</div>
 
 
@@ -347,6 +351,12 @@
 		</div>
 	</section>
 
+	<script>
+		var typed = new Typed('#element', {
+			strings: ['Engineer', 'Powerlifter', 'Developer'],
+			typeSpeed: 100,
+		});
+	</script>
 	<script type="text/javascript" src="script.js"></script>
 </body>
 
