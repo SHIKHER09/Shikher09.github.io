@@ -1,0 +1,1691 @@
+#!/bin/bash
+
+# Central Data Forwarder Script
+# This script runs on the central server to forward collected data to external SRE API
+# It should be scheduled via cron to run periodically
+
+# Configuration
+CENTRAL_SERVER_URL="http://localhost:3000"
+LOG_FILE="/var/log/sre-data-forwarder.log"
+LOCK_FILE="/tmp/sre-forwarder.lock"
+MAX_RECORDS_PER_BATCH=50
+DEFAULT_HOURS_BACK=1
+
+# Function to log messages
+log_message() {
+    local level="$1"
+    local message="$2"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+}
+
+# Function to check if another instance is running
+check_lock() {
+    if [[ -f "$LOCK_FILE" ]]; then
+        local pid=$(cat "$LOCK_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            log_message "WARN" "Another instance is already running (PID: $pid)"
+            exit 1
+        else
+            log_message "INFO" "Removing stale lock file"
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    
+    # Create lock file
+    echo $$ > "$LOCK_FILE"
+    
+    # Remove lock file on exit
+    trap 'rm -f "$LOCK_FILE"' EXIT
+}
+
+# Function to check central API health
+check_central_api() {
+    local health_url="$CENTRAL_SERVER_URL/api/health"
+    local response=$(curl -s -w "%{http_code}" "$health_url" 2>/dev/null)
+    local http_code="${response: -3}"
+    
+    if [[ "$http_code" == "200" ]]; then
+        log_message "INFO" "Central API is healthy"
+        return 0
+    else
+        log_message "ERROR" "Central API health check failed (HTTP: $http_code)"
+        return 1
+    fi
+}
+
+# Function to get pending records count
+get_pending_count() {
+    local hours_back="${1:-$DEFAULT_HOURS_BACK}"
+    local url="$CENTRAL_SERVER_URL/api/v1/monitoring/pending-count?hours_back=$hours_back"
+    
+    local response=$(curl -s "$url" 2>/dev/null)
+    if [[ $? -eq 0 ]]; then
+        # Extract pending count using basic text processing (no jq dependency)
+        local pending=$(echo "$response" | grep -o '"pending_records":[0-9]*' | cut -d':' -f2)
+        echo "${pending:-0}"
+    else
+        log_message "ERROR" "Failed to get pending records count"
+        echo "0"
+    fi
+}
+
+# Function to forward data in batches
+forward_data_batch() {
+    local hours_back="${1:-$DEFAULT_HOURS_BACK}"
+    local batch_size="${2:-$MAX_RECORDS_PER_BATCH}"
+    local dry_run="${3:-false}"
+    
+    log_message "INFO" "Starting batch forward (hours_back: $hours_back, batch_size: $batch_size, dry_run: $dry_run)"
+    
+    local url="$CENTRAL_SERVER_URL/api/v1/monitoring/bulk-forward"
+    local payload="{
+        \"hours_back\": $hours_back,
+        \"batch_size\": $batch_size,
+        \"mark_as_sent\": true
+    }"
+    
+    if [[ "$dry_run" == "true" ]]; then
+        # Dry run - just check what would be sent
+        local auto_forward_url="$CENTRAL_SERVER_URL/api/v1/monitoring/auto-forward"
+        local dry_run_payload="{\"hours_back\": $hours_back, \"dry_run\": true}"
+        
+        local response=$(curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d "$dry_run_payload" \
+            "$auto_forward_url" 2>/dev/null)
+        
+        if [[ $? -eq 0 ]]; then
+            local pending_count=$(echo "$response" | grep -o '"pending_count":[0-9]*' | cut -d':' -f2)
+            log_message "INFO" "Dry run: Would forward ${pending_count:-0} records"
+            echo "$response"
+            return 0
+        else
+            log_message "ERROR" "Dry run request failed"
+            return 1
+        fi
+    else
+        # Actual forward
+        local response=$(curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$url" 2>/dev/null)
+        
+        if [[ $? -eq 0 ]]; then
+            # Extract summary information
+            local total=$(echo "$response" | grep -o '"total":[0-9]*' | cut -d':' -f2)
+            local successful=$(echo "$response" | grep -o '"successful":[0-9]*' | cut -d':' -f2)
+            local failed=$(echo "$response" | grep -o '"failed":[0-9]*' | cut -d':' -f2)
+            
+            log_message "INFO" "Batch forward completed: ${successful:-0}/${total:-0} successful, ${failed:-0} failed"
+            
+            if [[ "${failed:-0}" -eq 0 ]]; then
+                return 0
+            else
+                log_message "WARN" "Some records failed to forward"
+                return 2  # Partial success
+            fi
+        else
+            log_message "ERROR" "Batch forward request failed"
+            return 1
+        fi
+    fi
+}
+
+# Function to run continuous forwarding until all pending records are sent
+forward_all_pending() {
+    local hours_back="${1:-$DEFAULT_HOURS_BACK}"
+    local max_iterations=10
+    local iteration=0
+    
+    log_message "INFO" "Starting continuous forwarding for last $hours_back hours"
+    
+    while [[ $iteration -lt $max_iterations ]]; do
+        ((iteration++))
+        
+        # Get pending count
+        local pending=$(get_pending_count "$hours_back")
+        log_message "INFO" "Iteration $iteration: $pending pending records"
+        
+        if [[ "$pending" -eq 0 ]]; then
+            log_message "INFO" "No more pending records to forward"
+            break
+        fi
+        
+        # Forward a batch
+        if forward_data_batch "$hours_back" "$MAX_RECORDS_PER_BATCH" "false"; then
+            log_message "INFO" "Batch $iteration completed successfully"
+            sleep 2  # Brief pause between batches
+        else
+            log_message "ERROR" "Batch $iteration failed, stopping"
+            return 1
+        fi
+    done
+    
+    if [[ $iteration -ge $max_iterations ]]; then
+        log_message "WARN" "Reached maximum iterations ($max_iterations), stopping"
+        return 2
+    fi
+    
+    log_message "INFO" "Continuous forwarding completed in $iteration iterations"
+    return 0
+}
+
+# Function to show statistics
+show_statistics() {
+    local hours_back="${1:-24}"
+    local url="$CENTRAL_SERVER_URL/api/v1/monitoring/stats?hours_back=$hours_back"
+    
+    log_message "INFO" "Fetching statistics for last $hours_back hours"
+    
+    local response=$(curl -s "$url" 2>/dev/null)
+    if [[ $? -eq 0 ]]; then
+        echo "Statistics for last $hours_back hours:"
+        echo "=================================="
+        
+        # Extract key statistics (basic parsing without jq)
+        local total_records=$(echo "$response" | grep -o '"total_records":"[0-9]*"' | cut -d'"' -f4)
+        local avg_cpu=$(echo "$response" | grep -o '"avg_cpu_usage":"[0-9.]*"' | cut -d'"' -f4)
+        local avg_ram=$(echo "$response" | grep -o '"avg_ram_usage":"[0-9.]*"' | cut -d'"' -f4)
+        local unique_servers=$(echo "$response" | grep -o '"unique_servers":"[0-9]*"' | cut -d'"' -f4)
+        
+        echo "Total Records: ${total_records:-N/A}"
+        echo "Unique Servers: ${unique_servers:-N/A}"
+        echo "Average CPU Usage: ${avg_cpu:-N/A}%"
+        echo "Average RAM Usage: ${avg_ram:-N/A}%"
+        echo ""
+        
+        # Get pending count
+        local pending=$(get_pending_count "$hours_back")
+        echo "Pending to Forward: $pending"
+        echo ""
+    else
+        log_message "ERROR" "Failed to fetch statistics"
+        return 1
+    fi
+}
+
+# Function to show usage
+show_usage() {
+    cat << EOF
+SRE Data Forwarder Script
+
+Usage: $0 [COMMAND] [OPTIONS]
+
+COMMANDS:
+    forward [HOURS]     Forward pending data from last N hours (default: $DEFAULT_HOURS_BACK)
+    forward-all [HOURS] Forward all pending data in batches until complete
+    dry-run [HOURS]     Show what would be forwarded without actually sending
+    status              Show current system status and statistics
+    pending [HOURS]     Show count of pending records
+    health              Check central API health
+
+OPTIONS:
+    --batch-size N      Set batch size (default: $MAX_RECORDS_PER_BATCH)
+    --help, -h          Show this help message
+
+EXAMPLES:
+    $0 forward                    # Forward data from last 1 hour
+    $0 forward 4                  # Forward data from last 4 hours
+    $0 forward-all 24             # Forward all pending data from last 24 hours
+    $0 dry-run 2                  # Show what would be forwarded from last 2 hours
+    $0 status                     # Show system status
+    $0 pending 6                  # Show pending records from last 6 hours
+
+CONFIGURATION:
+    Central Server: $CENTRAL_SERVER_URL
+    Log File: $LOG_FILE
+    Lock File: $LOCK_FILE
+    Max Batch Size: $MAX_RECORDS_PER_BATCH
+
+SCHEDULING:
+    Add to crontab for automatic forwarding:
+    # Forward data every hour
+    0 * * * * /path/to/forward_scheduler.sh forward 1
+    
+    # Forward all pending data every 4 hours
+    0 */4 * * * /path/to/forward_scheduler.sh forward-all 4
+
+EOF
+}
+
+# Main execution
+main() {
+    local command="${1:-forward}"
+    local hours_back="${2:-$DEFAULT_HOURS_BACK}"
+    
+    # Handle help
+    if [[ "$command" == "--help" || "$command" == "-h" ]]; then
+        show_usage
+        exit 0
+    fi
+    
+    # Check for lock (prevent concurrent runs)
+    check_lock
+    
+    log_message "INFO" "Starting SRE Data Forwarder - Command: $command"
+    
+    # Handle different commands
+    case "$command" in
+        "forward")
+            if check_central_api; then
+                forward_data_batch "$hours_back" "$MAX_RECORDS_PER_BATCH" "false"
+                exit_code=$?
+            else
+                exit_code=1
+            fi
+            ;;
+        "forward-all")
+            if check_central_api; then
+                forward_all_pending "$hours_back"
+                exit_code=$?
+            else
+                exit_code=1
+            fi
+            ;;
+        "dry-run")
+            if check_central_api; then
+                forward_data_batch "$hours_back" "$MAX_RECORDS_PER_BATCH" "true"
+                exit_code=$?
+            else
+                exit_code=1
+            fi
+            ;;
+        "status")
+            if check_central_api; then
+                show_statistics "$hours_back"
+                exit_code=$?
+            else
+                exit_code=1
+            fi
+            ;;
+        "pending")
+            if check_central_api; then
+                local pending=$(get_pending_count "$hours_back")
+                echo "Pending records (last $hours_back hours): $pending"
+                log_message "INFO" "Pending records: $pending"
+                exit_code=0
+            else
+                exit_code=1
+            fi
+            ;;
+        "health")
+            check_central_api
+            exit_code=$?
+            ;;
+        *)
+            log_message "ERROR" "Unknown command: $command"
+            show_usage
+            exit_code=1
+            ;;
+    esac
+    
+    log_message "INFO" "SRE Data Forwarder completed with exit code: $exit_code"
+    exit $exit_code
+}
+
+# Run main function with all arguments
+main "$@"
+
+
+
+#!/bin/bash
+
+# SRE Client Monitoring Script
+# This script runs on individual servers and sends data to central Node.js backend
+
+# Configuration - Update with your central server details
+CENTRAL_API_ENDPOINT="http://your-central-server:3000/api/v1/monitoring/store"
+SERVER_NAME="$(hostname)"
+RETRY_ATTEMPTS=3
+RETRY_DELAY=5
+
+# Optional: Server identification (if you want custom server identification)
+# CUSTOM_SERVER_ID="web-server-01"  # Uncomment and set custom ID
+
+# Function to get server IP
+get_server_ip() {
+    # Try to get private IP first (common for EC2/internal networks)
+    local ip=$(hostname -I | awk '{print $1}')
+    if [[ -z "$ip" ]]; then
+        # Fallback to public IP via external service
+        ip=$(curl -s http://checkip.amazonaws.com/ 2>/dev/null)
+    fi
+    if [[ -z "$ip" ]]; then
+        # Final fallback - use hostname resolution
+        ip=$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null)
+    fi
+    echo "$ip"
+}
+
+# Function to get CPU usage
+get_cpu_usage() {
+    # Get CPU usage percentage (1-minute average)
+    local cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | awk -F'%' '{print $1}')
+    # Alternative method using vmstat
+    if [[ -z "$cpu_usage" ]]; then
+        cpu_usage=$(vmstat 1 2 | tail -1 | awk '{print 100-$15}')
+    fi
+    # Fallback using /proc/loadavg
+    if [[ -z "$cpu_usage" ]]; then
+        cpu_usage=$(awk '{print $1 * 100}' /proc/loadavg)
+    fi
+    echo "$cpu_usage"
+}
+
+# Function to get RAM usage
+get_ram_usage() {
+    local mem_info=$(free -m)
+    local total_mb=$(echo "$mem_info" | awk 'NR==2{print $2}')
+    local used_mb=$(echo "$mem_info" | awk 'NR==2{print $3}')
+    local used_percentage=$(echo "scale=2; $used_mb * 100 / $total_mb" | bc)
+
+    echo "$total_mb,$used_mb,$used_percentage"
+}
+
+# Function to get disk usage
+get_disk_usage() {
+    local disk_data=""
+    local first=true
+
+    # Get disk usage for mounted filesystems
+    while read -r filesystem size used avail use_percent mount; do
+        if [[ "$filesystem" =~ ^/dev/ ]] || [[ "$mount" == "/" ]] || [[ "$mount" =~ ^/[a-zA-Z] ]]; then
+            if [[ "$first" == true ]]; then
+                first=false
+            else
+                disk_data+=","
+            fi
+
+            # Remove % from use_percent
+            use_percent_num=$(echo "$use_percent" | sed 's/%//')
+
+            disk_data+="{\"filesystem\":\"$filesystem\",\"mount_point\":\"$mount\",\"total_size\":\"$size\",\"used_space\":\"$used\",\"available_space\":\"$avail\",\"used_percentage\":$use_percent_num}"
+        fi
+    done < <(df -h | tail -n +2)
+
+    echo "[$disk_data]"
+}
+
+# Function to check MongoDB service status
+get_mongodb_service_status() {
+    local service_status="INACTIVE"
+
+    # Method 1: Check process directly
+    if pgrep -f "mongod\|mongo" >/dev/null 2>&1; then
+        service_status="ACTIVE"
+        echo "$service_status"
+        return
+    fi
+
+    # Method 2: Check if MongoDB is listening on port
+    if netstat -tln 2>/dev/null | grep -q ":27017\|:27018\|:27019" || ss -tln 2>/dev/null | grep -q ":27017\|:27018\|:27019"; then
+        service_status="ACTIVE"
+        echo "$service_status"
+        return
+    fi
+
+    # Method 3: Try connecting to database (if connection works, service is active)
+    if command -v mongo >/dev/null 2>&1; then
+        if timeout 5 mongo --eval "db.adminCommand('ping')" >/dev/null 2>&1; then
+            service_status="ACTIVE"
+            echo "$service_status"
+            return
+        fi
+    elif command -v mongosh >/dev/null 2>&1; then
+        if timeout 5 mongosh --eval "db.adminCommand('ping')" >/dev/null 2>&1; then
+            service_status="ACTIVE"
+            echo "$service_status"
+            return
+        fi
+    fi
+
+    # Method 4: Fallback to systemctl (traditional method)
+    if systemctl is-active --quiet mongod 2>/dev/null; then
+        service_status="ACTIVE"
+    elif systemctl is-active --quiet mongodb 2>/dev/null; then
+        service_status="ACTIVE"
+    fi
+
+    echo "$service_status"
+}
+
+# Function to get MongoDB connection info
+get_mongodb_connection_info() {
+    local mongo_command=""
+    local connection_status="FAILED"
+    local active_connections=0
+    local available_connections=0
+    local total_created=0
+    local pool_usage_percentage=0.0
+
+    # Try different MongoDB command variations
+    if command -v mongo >/dev/null 2>&1; then
+        mongo_command="mongo"
+    elif command -v mongosh >/dev/null 2>&1; then
+        mongo_command="mongosh"
+    fi
+
+    if [[ -n "$mongo_command" ]]; then
+        # Try to connect and get server status
+        local mongo_output
+        mongo_output=$(timeout 10 $mongo_command --quiet --eval "
+            try {
+                var status = db.serverStatus();
+                var connections = status.connections;
+                print('SUCCESS,' + connections.current + ',' + connections.available + ',' + connections.totalCreated);
+            } catch(e) {
+                print('FAILED,0,0,0');
+            }
+        " 2>/dev/null)
+
+        if [[ $? -eq 0 && -n "$mongo_output" ]]; then
+            IFS=',' read -r connection_status active_connections available_connections total_created <<< "$mongo_output"
+
+            # Calculate pool usage percentage
+            if [[ $available_connections -gt 0 ]]; then
+                pool_usage_percentage=$(echo "scale=2; $active_connections * 100 / ($active_connections + $available_connections)" | bc)
+            fi
+        fi
+    fi
+
+    echo "$connection_status,$active_connections,$available_connections,$total_created,$pool_usage_percentage"
+}
+
+# Function to check PostgreSQL service status
+get_postgresql_service_status() {
+    local service_status="INACTIVE"
+
+    # Method 1: Check using pg_lsclusters (Debian/Ubuntu specific)
+    if command -v pg_lsclusters >/dev/null 2>&1; then
+        local cluster_status=$(pg_lsclusters -h 2>/dev/null | awk '{if($4=="online") print "ACTIVE"}' | head -1)
+        if [[ "$cluster_status" == "ACTIVE" ]]; then
+            service_status="ACTIVE"
+            echo "$service_status"
+            return
+        fi
+    fi
+
+    # Method 2: Check process directly
+    if pgrep -f "postgres.*main\|postgres.*master\|postgresql" >/dev/null 2>&1; then
+        service_status="ACTIVE"
+        echo "$service_status"
+        return
+    fi
+
+    # Method 3: Check if PostgreSQL is listening on port
+    if netstat -tln 2>/dev/null | grep -q ":5432\|:5433\|:5434" || ss -tln 2>/dev/null | grep -q ":5432\|:5433\|:5434"; then
+        service_status="ACTIVE"
+        echo "$service_status"
+        return
+    fi
+
+    # Method 4: Try connecting to database (if connection works, service is active)
+    if command -v psql >/dev/null 2>&1; then
+        if timeout 10 sudo -u postgres psql -d postgres -c "SELECT 1;" >/dev/null 2>&1; then
+            service_status="ACTIVE"
+            echo "$service_status"
+            return
+        fi
+    fi
+
+    # Method 5: Fallback to systemctl (traditional method)
+    if systemctl is-active --quiet postgresql 2>/dev/null; then
+        service_status="ACTIVE"
+    elif systemctl is-active --quiet postgresql-* 2>/dev/null | head -1 | grep -q "active"; then
+        service_status="ACTIVE"
+    elif systemctl is-active --quiet postgres 2>/dev/null; then
+        service_status="ACTIVE"
+    fi
+
+    echo "$service_status"
+}
+
+# Function to get PostgreSQL connection info
+get_postgresql_connection_info() {
+    local connection_status="FAILED"
+    local active_connections=0
+    local max_connections=100
+    local total_connections=0
+    local pool_usage_percentage=0.0
+    local db_name="postgres"
+
+    # Check if psql command exists
+    if command -v psql >/dev/null 2>&1; then
+        # Try to connect and get connection stats
+        local pg_output
+        pg_output=$(timeout 10 sudo -u postgres psql -d "$db_name" -t -c "
+            SELECT
+                CASE WHEN pg_is_in_recovery() = false THEN 'SUCCESS' ELSE 'FAILED' END as status,
+                (SELECT count(*) FROM pg_stat_activity WHERE state = 'active') as active,
+                (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') as max_conn,
+                (SELECT count(*) FROM pg_stat_activity) as total
+        " 2>/dev/null | tr -d ' ' | grep -v '^$')
+
+        if [[ $? -eq 0 && -n "$pg_output" ]]; then
+            # Parse the output (format: status|active|max_conn|total)
+            IFS='|' read -r connection_status active_connections max_connections total_connections <<< "$pg_output"
+
+            # Calculate pool usage percentage
+            if [[ $max_connections -gt 0 ]]; then
+                pool_usage_percentage=$(echo "scale=2; $active_connections * 100 / $max_connections" | bc)
+            fi
+        fi
+    fi
+
+    echo "$connection_status,$active_connections,$max_connections,$total_connections,$pool_usage_percentage"
+}
+
+# Function to create JSON payload
+create_json_payload() {
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local server_ip=$(get_server_ip)
+    local cpu_usage=$(get_cpu_usage)
+
+    # Use custom server ID if set, otherwise use IP
+    local server_identifier="${CUSTOM_SERVER_ID:-$server_ip}"
+
+    # Get RAM info
+    IFS=',' read -r ram_total ram_used ram_percentage <<< "$(get_ram_usage)"
+
+    # Get disk info
+    local disk_partitions=$(get_disk_usage)
+
+    # Get MongoDB service status
+    local mongodb_status=$(get_mongodb_service_status)
+
+    # Get MongoDB connection info
+    IFS=',' read -r db_connection active_conn available_conn total_created pool_usage <<< "$(get_mongodb_connection_info)"
+
+    # Get PostgreSQL service status
+    local postgresql_status=$(get_postgresql_service_status)
+
+    # Get PostgreSQL connection info
+    IFS=',' read -r pg_connection pg_active_conn pg_max_conn pg_total_conn pg_pool_usage <<< "$(get_postgresql_connection_info)"
+
+    # Create JSON payload
+    cat << EOF
+{
+  "timestamp": "$timestamp",
+  "serverip": "$server_identifier",
+  "hostname": "$SERVER_NAME",
+  "cpu_usage": {
+    "percentage": $cpu_usage
+  },
+  "ram_usage": {
+    "total_mb": $ram_total,
+    "used_mb": $ram_used,
+    "used_percentage": $ram_percentage
+  },
+  "disk_partitions": $disk_partitions,
+  "mongodb_service": {
+    "service_name": "mongodb",
+    "service_status": "$mongodb_status"
+  },
+  "mongodb_connection": {
+    "database_connection": "$db_connection",
+    "active_connections": $active_conn,
+    "available_connections": $available_conn,
+    "total_created": $total_created,
+    "pool_usage_percentage": $pool_usage
+  },
+  "postgresql_service": {
+    "service_name": "postgresql",
+    "service_status": "$postgresql_status"
+  },
+  "postgresql_connection": {
+    "database_connection": "$pg_connection",
+    "active_connections": $pg_active_conn,
+    "max_connections": $pg_max_conn,
+    "total_connections": $pg_total_conn,
+    "pool_usage_percentage": $pg_pool_usage
+  }
+}
+EOF
+}
+
+# Function to send data to central API with retry logic
+send_to_central_api() {
+    local json_payload="$1"
+    local attempt=1
+    
+    while [[ $attempt -le $RETRY_ATTEMPTS ]]; do
+        echo "📡 Attempt $attempt/$RETRY_ATTEMPTS: Sending to central API: $CENTRAL_API_ENDPOINT"
+        
+        local response
+        response=$(curl -s -w "\n%{http_code}" -X POST \
+            --connect-timeout 10 \
+            --max-time 30 \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: SRE-Monitor/${SERVER_NAME}" \
+            -d "$json_payload" \
+            "$CENTRAL_API_ENDPOINT" 2>/dev/null)
+
+        # Get HTTP status code from response
+        local http_code=$(echo "$response" | tail -n1)
+        local response_body=$(echo "$response" | sed '$d')
+
+        if [[ "$http_code" -eq 201 ]]; then
+            echo "✅ Data sent successfully! HTTP Status: $http_code"
+            echo "Response: $response_body"
+            log_to_file "SUCCESS: Data sent to central API (attempt $attempt)"
+            return 0
+        else
+            echo "❌ Failed to send data. HTTP Status: $http_code"
+            echo "Response: $response_body"
+            log_to_file "FAILED: Attempt $attempt failed with HTTP $http_code"
+            
+            if [[ $attempt -lt $RETRY_ATTEMPTS ]]; then
+                echo "⏳ Retrying in $RETRY_DELAY seconds..."
+                sleep $RETRY_DELAY
+            fi
+        fi
+        
+        ((attempt++))
+    done
+    
+    echo "❌ All $RETRY_ATTEMPTS attempts failed!"
+    log_to_file "ERROR: All $RETRY_ATTEMPTS attempts to send data failed"
+    return 1
+}
+
+# Function to test central API connectivity
+test_central_api() {
+    echo "🔍 Testing connectivity to central API..."
+    
+    local health_endpoint="${CENTRAL_API_ENDPOINT%/*}/health"
+    local response=$(curl -s -w "%{http_code}" --connect-timeout 5 --max-time 10 "$health_endpoint" 2>/dev/null)
+    local http_code="${response: -3}"
+    
+    if [[ "$http_code" == "200" ]]; then
+        echo "✅ Central API is reachable and healthy"
+        return 0
+    else
+        echo "❌ Central API is not reachable (HTTP: $http_code)"
+        echo "   Endpoint: $health_endpoint"
+        echo "   Please check:"
+        echo "   1. Central server is running"
+        echo "   2. Network connectivity"
+        echo "   3. Firewall settings"
+        echo "   4. CENTRAL_API_ENDPOINT configuration"
+        return 1
+    fi
+}
+
+# Function to log to file
+log_to_file() {
+    local message="$1"
+    local log_file="/var/log/sre-client-monitor.log"
+    
+    # Create log directory if it doesn't exist
+    mkdir -p "$(dirname "$log_file")"
+    
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [$SERVER_NAME] $message" >> "$log_file"
+}
+
+# Function to validate JSON payload
+validate_json_payload() {
+    local json_payload="$1"
+    
+    # Check if jq is available for validation
+    if command -v jq >/dev/null 2>&1; then
+        if echo "$json_payload" | jq empty >/dev/null 2>&1; then
+            echo "✅ JSON payload is valid"
+            return 0
+        else
+            echo "❌ JSON payload is invalid!"
+            echo "$json_payload" | jq . 2>&1 || true
+            return 1
+        fi
+    else
+        # Basic JSON validation without jq
+        if [[ "$json_payload" =~ ^\{.*\}$ ]]; then
+            echo "✅ Basic JSON structure looks valid"
+            return 0
+        else
+            echo "❌ JSON payload doesn't look valid"
+            return 1
+        fi
+    fi
+}
+
+# Function to show system summary
+show_system_summary() {
+    echo ""
+    echo "📊 System Summary for $SERVER_NAME:"
+    echo "=================================="
+    echo "Server IP: $(get_server_ip)"
+    echo "Hostname: $SERVER_NAME"
+    echo "Timestamp: $(date)"
+    echo ""
+    
+    echo "💾 Resources:"
+    local cpu_usage=$(get_cpu_usage)
+    echo "  CPU Usage: ${cpu_usage}%"
+    
+    IFS=',' read -r ram_total ram_used ram_percentage <<< "$(get_ram_usage)"
+    echo "  RAM Usage: ${ram_used}MB / ${ram_total}MB (${ram_percentage}%)"
+    
+    echo ""
+    echo "🔧 Services:"
+    echo "  MongoDB: $(get_mongodb_service_status)"
+    echo "  PostgreSQL: $(get_postgresql_service_status)"
+    echo ""
+}
+
+# Function to check system prerequisites
+check_prerequisites() {
+    local missing_deps=()
+    
+    # Check for required commands
+    if ! command -v bc >/dev/null 2>&1; then
+        missing_deps+=("bc")
+    fi
+    
+    if ! command -v curl >/dev/null 2>&1; then
+        missing_deps+=("curl")
+    fi
+    
+    if ! command -v free >/dev/null 2>&1; then
+        missing_deps+=("procps")
+    fi
+    
+    if ! command -v df >/dev/null 2>&1; then
+        missing_deps+=("coreutils")
+    fi
+    
+    # Check for network tools (optional but recommended)
+    if ! command -v netstat >/dev/null 2>&1 && ! command -v ss >/dev/null 2>&1; then
+        echo "⚠️  Warning: Neither 'netstat' nor 'ss' found. Service detection may be limited."
+        echo "   Consider installing: sudo apt install net-tools"
+    fi
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        echo "❌ Missing required dependencies: ${missing_deps[*]}"
+        echo "   Please install them first:"
+        echo "   Ubuntu/Debian: sudo apt install ${missing_deps[*]}"
+        echo "   CentOS/RHEL: sudo yum install ${missing_deps[*]}"
+        return 1
+    fi
+    
+    echo "✅ All prerequisites are satisfied"
+    return 0
+}
+
+# Main execution function
+main() {
+    echo "🚀 SRE Client Monitoring Script"
+    echo "Server: $SERVER_NAME"
+    echo "Central API: $CENTRAL_API_ENDPOINT"
+    echo ""
+    
+    # Check prerequisites
+    if ! check_prerequisites; then
+        exit 1
+    fi
+    
+    # Test central API connectivity (optional check)
+    if ! test_central_api; then
+        echo ""
+        echo "⚠️  Central API test failed, but continuing anyway..."
+        echo "   The script will still attempt to send data."
+        echo ""
+    fi
+    
+    # Show system summary
+    if [[ "${1}" == "--summary" || "${1}" == "-s" ]]; then
+        show_system_summary
+        exit 0
+    fi
+    
+    echo "🔍 Gathering system information..."
+    log_to_file "Starting monitoring data collection"
+    
+    # Create JSON payload
+    local json_data
+    if ! json_data=$(create_json_payload); then
+        echo "❌ Failed to create JSON payload"
+        log_to_file "ERROR: Failed to create JSON payload"
+        exit 1
+    fi
+    
+    # Validate JSON payload
+    if ! validate_json_payload "$json_data"; then
+        echo "❌ Generated JSON payload is invalid"
+        log_to_file "ERROR: Invalid JSON payload generated"
+        exit 1
+    fi
+    
+    # Show payload if in verbose mode
+    if [[ "${1}" == "--verbose" || "${1}" == "-v" ]]; then
+        echo ""
+        echo "📋 Generated JSON payload:"
+        if command -v jq >/dev/null 2>&1; then
+            echo "$json_data" | jq .
+        else
+            echo "$json_data"
+        fi
+        echo ""
+    fi
+    
+    # Send data to central API
+    if send_to_central_api "$json_data"; then
+        echo "✅ Monitoring data sent successfully!"
+        log_to_file "SUCCESS: Monitoring completed successfully"
+        exit 0
+    else
+        echo "❌ Failed to send monitoring data after $RETRY_ATTEMPTS attempts"
+        log_to_file "ERROR: All attempts to send monitoring data failed"
+        exit 1
+    fi
+}
+
+# Usage information
+show_usage() {
+    echo "SRE Client Monitoring Script"
+    echo ""
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "OPTIONS:"
+    echo "  --help, -h        Show this help message"
+    echo "  --summary, -s     Show system summary only (don't send data)"
+    echo "  --verbose, -v     Show detailed output including JSON payload"
+    echo "  --test-api        Test central API connectivity only"
+    echo ""
+    echo "Configuration:"
+    echo "  CENTRAL_API_ENDPOINT: $CENTRAL_API_ENDPOINT"
+    echo "  SERVER_NAME: $SERVER_NAME"
+    echo "  RETRY_ATTEMPTS: $RETRY_ATTEMPTS"
+    echo ""
+    echo "Examples:"
+    echo "  $0                    # Send monitoring data"
+    echo "  $0 --summary          # Show system summary"
+    echo "  $0 --verbose          # Send data with detailed output"
+    echo "  $0 --test-api         # Test API connectivity"
+    echo ""
+    echo "Logs are written to: /var/log/sre-client-monitor.log"
+    echo ""
+}
+
+# Handle command line arguments
+case "${1:-}" in
+    "--help"|"-h")
+        show_usage
+        exit 0
+        ;;
+    "--test-api")
+        echo "🔍 Testing central API connectivity..."
+        test_central_api
+        exit $?
+        ;;
+    "--summary"|"-s")
+        main "$@"
+        ;;
+    "--verbose"|"-v")
+        main "$@"
+        ;;
+    "")
+        main "$@"
+        ;;
+    *)
+        echo "❌ Unknown option: $1"
+        echo "Use --help for usage information"
+        exit 1
+        ;;
+esac
+
+
+-- SRE Monitoring Database Schema
+-- Run this script to create the required database and table
+
+-- Create database (run as superuser)
+-- CREATE DATABASE sre_monitoring;
+
+-- Connect to the database and create the table
+-- \c sre_monitoring;
+
+-- Create the main monitoring data table
+CREATE TABLE IF NOT EXISTS sre_monitoring_data (
+    id SERIAL PRIMARY KEY,
+    timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+    server_ip INET NOT NULL,
+    
+    -- CPU metrics
+    cpu_usage_percentage DECIMAL(5,2) NOT NULL,
+    
+    -- RAM metrics
+    ram_total_mb INTEGER NOT NULL,
+    ram_used_mb INTEGER NOT NULL,
+    ram_used_percentage DECIMAL(5,2) NOT NULL,
+    
+    -- MongoDB metrics
+    mongodb_service_status VARCHAR(20) NOT NULL CHECK (mongodb_service_status IN ('ACTIVE', 'INACTIVE')),
+    mongodb_connection_status VARCHAR(20) NOT NULL CHECK (mongodb_connection_status IN ('SUCCESS', 'FAILED')),
+    mongodb_active_connections INTEGER NOT NULL DEFAULT 0,
+    mongodb_available_connections INTEGER NOT NULL DEFAULT 0,
+    mongodb_total_created INTEGER NOT NULL DEFAULT 0,
+    mongodb_pool_usage_percentage DECIMAL(5,2) NOT NULL DEFAULT 0,
+    
+    -- PostgreSQL metrics
+    postgresql_service_status VARCHAR(20) NOT NULL CHECK (postgresql_service_status IN ('ACTIVE', 'INACTIVE')),
+    postgresql_connection_status VARCHAR(20) NOT NULL CHECK (postgresql_connection_status IN ('SUCCESS', 'FAILED')),
+    postgresql_active_connections INTEGER NOT NULL DEFAULT 0,
+    postgresql_max_connections INTEGER NOT NULL DEFAULT 0,
+    postgresql_total_connections INTEGER NOT NULL DEFAULT 0,
+    postgresql_pool_usage_percentage DECIMAL(5,2) NOT NULL DEFAULT 0,
+    
+    -- JSON fields for complex data
+    disk_partitions_json JSONB NOT NULL,
+    raw_data_json JSONB NOT NULL,
+    
+    -- External API tracking fields
+    sent_to_external BOOLEAN DEFAULT FALSE,
+    sent_at TIMESTAMP WITH TIME ZONE NULL,
+    send_attempts INTEGER DEFAULT 0,
+    last_send_error TEXT NULL,
+    
+    -- Audit fields
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Create indexes for better query performance
+CREATE INDEX IF NOT EXISTS idx_sre_monitoring_timestamp ON sre_monitoring_data(timestamp);
+CREATE INDEX IF NOT EXISTS idx_sre_monitoring_server_ip ON sre_monitoring_data(server_ip);
+CREATE INDEX IF NOT EXISTS idx_sre_monitoring_server_timestamp ON sre_monitoring_data(server_ip, timestamp);
+CREATE INDEX IF NOT EXISTS idx_sre_monitoring_mongodb_status ON sre_monitoring_data(mongodb_service_status);
+CREATE INDEX IF NOT EXISTS idx_sre_monitoring_postgresql_status ON sre_monitoring_data(postgresql_service_status);
+CREATE INDEX IF NOT EXISTS idx_sre_monitoring_sent_external ON sre_monitoring_data(sent_to_external, timestamp);
+CREATE INDEX IF NOT EXISTS idx_sre_monitoring_pending ON sre_monitoring_data(timestamp) WHERE (sent_to_external IS NULL OR sent_to_external = false);
+
+-- Create a composite index for common queries
+CREATE INDEX IF NOT EXISTS idx_sre_monitoring_composite ON sre_monitoring_data(server_ip, timestamp DESC, mongodb_service_status, postgresql_service_status);
+
+-- Create GIN indexes for JSON fields (for JSON queries)
+CREATE INDEX IF NOT EXISTS idx_sre_monitoring_disk_partitions_gin ON sre_monitoring_data USING GIN(disk_partitions_json);
+CREATE INDEX IF NOT EXISTS idx_sre_monitoring_raw_data_gin ON sre_monitoring_data USING GIN(raw_data_json);
+
+-- Create a function to automatically update the updated_at timestamp
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+-- Create trigger to automatically update updated_at
+DROP TRIGGER IF EXISTS update_sre_monitoring_data_updated_at ON sre_monitoring_data;
+CREATE TRIGGER update_sre_monitoring_data_updated_at
+    BEFORE UPDATE ON sre_monitoring_data
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- Create a view for easy querying of latest data per server
+CREATE OR REPLACE VIEW latest_monitoring_data AS
+SELECT DISTINCT ON (server_ip) 
+    id,
+    timestamp,
+    server_ip,
+    cpu_usage_percentage,
+    ram_total_mb,
+    ram_used_mb,
+    ram_used_percentage,
+    mongodb_service_status,
+    mongodb_connection_status,
+    mongodb_active_connections,
+    mongodb_pool_usage_percentage,
+    postgresql_service_status,
+    postgresql_connection_status,
+    postgresql_active_connections,
+    postgresql_pool_usage_percentage,
+    disk_partitions_json,
+    created_at
+FROM sre_monitoring_data
+ORDER BY server_ip, timestamp DESC;
+
+-- Create a view for monitoring summary statistics
+CREATE OR REPLACE VIEW monitoring_summary AS
+SELECT 
+    DATE_TRUNC('hour', timestamp) as hour,
+    server_ip,
+    COUNT(*) as record_count,
+    AVG(cpu_usage_percentage) as avg_cpu_usage,
+    MAX(cpu_usage_percentage) as max_cpu_usage,
+    AVG(ram_used_percentage) as avg_ram_usage,
+    MAX(ram_used_percentage) as max_ram_usage,
+    SUM(CASE WHEN mongodb_service_status = 'ACTIVE' THEN 1 ELSE 0 END) as mongodb_active_count,
+    SUM(CASE WHEN postgresql_service_status = 'ACTIVE' THEN 1 ELSE 0 END) as postgresql_active_count,
+    MIN(timestamp) as first_record,
+    MAX(timestamp) as last_record
+FROM sre_monitoring_data
+GROUP BY DATE_TRUNC('hour', timestamp), server_ip
+ORDER BY hour DESC, server_ip;
+
+-- Create a function to clean old data (optional - for data retention)
+CREATE OR REPLACE FUNCTION cleanup_old_monitoring_data(retention_days INTEGER DEFAULT 90)
+RETURNS INTEGER AS $$
+DECLARE
+    deleted_count INTEGER;
+BEGIN
+    DELETE FROM sre_monitoring_data 
+    WHERE timestamp < NOW() - INTERVAL '1 day' * retention_days;
+    
+    GET DIAGNOSTICS deleted_count = ROW_COUNT;
+    
+    -- Log the cleanup operation
+    RAISE NOTICE 'Cleaned up % old monitoring records older than % days', deleted_count, retention_days;
+    
+    RETURN deleted_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Grant permissions (adjust as needed for your user)
+-- GRANT SELECT, INSERT, UPDATE, DELETE ON sre_monitoring_data TO your_app_user;
+-- GRANT USAGE, SELECT ON SEQUENCE sre_monitoring_data_id_seq TO your_app_user;
+-- GRANT SELECT ON latest_monitoring_data TO your_app_user;
+-- GRANT SELECT ON monitoring_summary TO your_app_user;
+
+-- Sample query examples (commented out):
+
+-- Get latest data for all servers
+-- SELECT * FROM latest_monitoring_data;
+
+-- Get hourly summary for the last 24 hours
+-- SELECT * FROM monitoring_summary WHERE hour >= NOW() - INTERVAL '24 hours';
+
+-- Find servers with high CPU usage
+-- SELECT server_ip, timestamp, cpu_usage_percentage 
+-- FROM sre_monitoring_data 
+-- WHERE cpu_usage_percentage > 80 
+-- ORDER BY timestamp DESC;
+
+-- Find servers with MongoDB/PostgreSQL issues
+-- SELECT server_ip, timestamp, mongodb_service_status, postgresql_service_status
+-- FROM sre_monitoring_data 
+-- WHERE mongodb_service_status = 'INACTIVE' OR postgresql_service_status = 'INACTIVE'
+-- ORDER BY timestamp DESC;
+
+-- Query disk usage from JSON field
+-- SELECT server_ip, timestamp, 
+--        jsonb_pretty(disk_partitions_json) as disk_info
+-- FROM sre_monitoring_data 
+-- WHERE disk_partitions_json @> '[{"used_percentage": 90}]'::jsonb;
+
+-- Clean up data older than 30 days (use carefully!)
+-- SELECT cleanup_old_monitoring_data(30);
+
+
+
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
+const axios = require('axios');
+const Joi = require('joi');
+require('dotenv').config();
+
+const { Pool } = require('pg');
+const app = express();
+
+// Database connection
+const pool = new Pool({
+  user: process.env.DB_USER || 'postgres',
+  host: process.env.DB_HOST || 'localhost',
+  database: process.env.DB_NAME || 'sre_monitoring',
+  password: process.env.DB_PASSWORD || 'password',
+  port: process.env.DB_PORT || 5432,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+});
+
+// Middleware
+app.use(helmet());
+app.use(compression());
+app.use(cors({
+  origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again later.'
+});
+app.use('/api/', limiter);
+
+// Validation schemas
+const monitoringDataSchema = Joi.object({
+  timestamp: Joi.string().isoDate().required(),
+  serverip: Joi.string().ip().required(),
+  cpu_usage: Joi.object({
+    percentage: Joi.number().min(0).max(100).required()
+  }).required(),
+  ram_usage: Joi.object({
+    total_mb: Joi.number().positive().required(),
+    used_mb: Joi.number().min(0).required(),
+    used_percentage: Joi.number().min(0).max(100).required()
+  }).required(),
+  disk_partitions: Joi.array().items(
+    Joi.object({
+      filesystem: Joi.string().required(),
+      mount_point: Joi.string().required(),
+      total_size: Joi.string().required(),
+      used_space: Joi.string().required(),
+      available_space: Joi.string().required(),
+      used_percentage: Joi.number().min(0).max(100).required()
+    })
+  ).required(),
+  mongodb_service: Joi.object({
+    service_name: Joi.string().required(),
+    service_status: Joi.string().valid('ACTIVE', 'INACTIVE').required()
+  }).required(),
+  mongodb_connection: Joi.object({
+    database_connection: Joi.string().valid('SUCCESS', 'FAILED').required(),
+    active_connections: Joi.number().min(0).required(),
+    available_connections: Joi.number().min(0).required(),
+    total_created: Joi.number().min(0).required(),
+    pool_usage_percentage: Joi.number().min(0).max(100).required()
+  }).required(),
+  postgresql_service: Joi.object({
+    service_name: Joi.string().required(),
+    service_status: Joi.string().valid('ACTIVE', 'INACTIVE').required()
+  }).required(),
+  postgresql_connection: Joi.object({
+    database_connection: Joi.string().valid('SUCCESS', 'FAILED').required(),
+    active_connections: Joi.number().min(0).required(),
+    max_connections: Joi.number().min(0).required(),
+    total_connections: Joi.number().min(0).required(),
+    pool_usage_percentage: Joi.number().min(0).max(100).required()
+  }).required()
+});
+
+// Database connection test
+pool.on('connect', () => {
+  console.log('Connected to PostgreSQL database');
+});
+
+pool.on('error', (err) => {
+  console.error('Unexpected error on idle client', err);
+  process.exit(-1);
+});
+
+// Health check endpoint
+app.get('/api/health', async (req, res) => {
+  try {
+    await pool.query('SELECT NOW()');
+    res.json({
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      database: 'connected'
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'unhealthy',
+      timestamp: new Date().toISOString(),
+      database: 'disconnected',
+      error: error.message
+    });
+  }
+});
+
+// Store monitoring data endpoint
+app.post('/api/v1/monitoring/store', async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    // Validate input
+    const { error, value } = monitoringDataSchema.validate(req.body);
+    if (error) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation error',
+        details: error.details
+      });
+    }
+
+    const data = value;
+    
+    // Start transaction
+    await client.query('BEGIN');
+
+    // Insert main monitoring record
+    const insertQuery = `
+      INSERT INTO sre_monitoring_data (
+        timestamp, server_ip, cpu_usage_percentage,
+        ram_total_mb, ram_used_mb, ram_used_percentage,
+        mongodb_service_status, mongodb_connection_status,
+        mongodb_active_connections, mongodb_available_connections,
+        mongodb_total_created, mongodb_pool_usage_percentage,
+        postgresql_service_status, postgresql_connection_status,
+        postgresql_active_connections, postgresql_max_connections,
+        postgresql_total_connections, postgresql_pool_usage_percentage,
+        disk_partitions_json, raw_data_json
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+      RETURNING id
+    `;
+
+    const values = [
+      data.timestamp,
+      data.serverip,
+      data.cpu_usage.percentage,
+      data.ram_usage.total_mb,
+      data.ram_usage.used_mb,
+      data.ram_usage.used_percentage,
+      data.mongodb_service.service_status,
+      data.mongodb_connection.database_connection,
+      data.mongodb_connection.active_connections,
+      data.mongodb_connection.available_connections,
+      data.mongodb_connection.total_created,
+      data.mongodb_connection.pool_usage_percentage,
+      data.postgresql_service.service_status,
+      data.postgresql_connection.database_connection,
+      data.postgresql_connection.active_connections,
+      data.postgresql_connection.max_connections,
+      data.postgresql_connection.total_connections,
+      data.postgresql_connection.pool_usage_percentage,
+      JSON.stringify(data.disk_partitions),
+      JSON.stringify(data)
+    ];
+
+    const result = await client.query(insertQuery, values);
+    const recordId = result.rows[0].id;
+
+    // Commit transaction
+    await client.query('COMMIT');
+
+    res.status(201).json({
+      success: true,
+      message: 'Monitoring data stored successfully',
+      record_id: recordId,
+      timestamp: data.timestamp
+    });
+
+  } catch (error) {
+    // Rollback transaction
+    await client.query('ROLLBACK');
+    
+    console.error('Error storing monitoring data:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to store monitoring data',
+      error: error.message
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// Get monitoring data endpoint
+app.get('/api/v1/monitoring/data', async (req, res) => {
+  try {
+    const { 
+      limit = 50, 
+      offset = 0, 
+      server_ip, 
+      from_date, 
+      to_date,
+      format = 'full' 
+    } = req.query;
+
+    let query = 'SELECT * FROM sre_monitoring_data WHERE 1=1';
+    const queryParams = [];
+    let paramIndex = 1;
+
+    // Add filters
+    if (server_ip) {
+      query += ` AND server_ip = $${paramIndex}`;
+      queryParams.push(server_ip);
+      paramIndex++;
+    }
+
+    if (from_date) {
+      query += ` AND timestamp >= $${paramIndex}`;
+      queryParams.push(from_date);
+      paramIndex++;
+    }
+
+    if (to_date) {
+      query += ` AND timestamp <= $${paramIndex}`;
+      queryParams.push(to_date);
+      paramIndex++;
+    }
+
+    query += ' ORDER BY timestamp DESC';
+    query += ` LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+    queryParams.push(parseInt(limit), parseInt(offset));
+
+    const result = await pool.query(query, queryParams);
+
+    // Format response based on requested format
+    let responseData;
+    if (format === 'original') {
+      responseData = result.rows.map(row => JSON.parse(row.raw_data_json));
+    } else {
+      responseData = result.rows;
+    }
+
+    res.json({
+      success: true,
+      data: responseData,
+      count: result.rows.length,
+      pagination: {
+        limit: parseInt(limit),
+        offset: parseInt(offset),
+        has_more: result.rows.length === parseInt(limit)
+      }
+    });
+
+  } catch (error) {
+    console.error('Error retrieving monitoring data:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to retrieve monitoring data',
+      error: error.message
+    });
+  }
+});
+
+// Bulk forward data to external SRE API endpoint (for scheduled/batch processing)
+app.post('/api/v1/monitoring/bulk-forward', async (req, res) => {
+  try {
+    const { 
+      hours_back = 1, 
+      server_ips = [], 
+      batch_size = 10,
+      mark_as_sent = false 
+    } = req.body;
+
+    // Build query based on parameters
+    let query = `
+      SELECT id, raw_data_json, server_ip, timestamp 
+      FROM sre_monitoring_data 
+      WHERE timestamp >= NOW() - INTERVAL '${hours_back} hours'
+    `;
+    
+    let queryParams = [];
+    let paramIndex = 1;
+
+    // Filter by specific server IPs if provided
+    if (server_ips.length > 0) {
+      const placeholders = server_ips.map(() => `$${paramIndex++}`).join(',');
+      query += ` AND server_ip IN (${placeholders})`;
+      queryParams.push(...server_ips);
+    }
+
+    // Only get records that haven't been sent (if tracking is enabled)
+    if (mark_as_sent) {
+      query += ` AND (sent_to_external IS NULL OR sent_to_external = false)`;
+    }
+
+    query += ` ORDER BY timestamp ASC LIMIT ${batch_size}`;
+
+    const result = await pool.query(query, queryParams);
+    
+    if (result.rows.length === 0) {
+      return res.json({
+        success: true,
+        message: 'No new records to forward',
+        summary: { total: 0, successful: 0, failed: 0 }
+      });
+    }
+
+    console.log(`📤 Forwarding ${result.rows.length} records to external API...`);
+
+    // Forward records to external API
+    const forwardResults = [];
+    const externalApiUrl = 'https://sre1.kfintech.com/SREScheduler/api/v1/MongoDB/MongoDBdata';
+    
+    for (const row of result.rows) {
+      try {
+        const monitoringData = JSON.parse(row.raw_data_json);
+        
+        const response = await axios.post(externalApiUrl, monitoringData, {
+          headers: {
+            'Content-Type': 'application/json',
+            ...(process.env.SRE_API_KEY && { 'Authorization': `Bearer ${process.env.SRE_API_KEY}` })
+          },
+          timeout: 15000
+        });
+
+        forwardResults.push({
+          record_id: row.id,
+          success: true,
+          server_ip: monitoringData.serverip,
+          timestamp: monitoringData.timestamp,
+          status_code: response.status,
+          response_preview: typeof response.data === 'string' ? 
+            response.data.substring(0, 100) : JSON.stringify(response.data).substring(0, 100)
+        });
+
+        // Mark as sent if requested
+        if (mark_as_sent) {
+          await pool.query(
+            'UPDATE sre_monitoring_data SET sent_to_external = true, sent_at = NOW() WHERE id = $1',
+            [row.id]
+          );
+        }
+
+      } catch (forwardError) {
+        console.error(`❌ Failed to forward record ${row.id}:`, forwardError.message);
+        
+        forwardResults.push({
+          record_id: row.id,
+          success: false,
+          server_ip: row.server_ip,
+          timestamp: row.timestamp,
+          error: forwardError.message,
+          status_code: forwardError.response?.status || null
+        });
+      }
+    }
+
+    const successCount = forwardResults.filter(r => r.success).length;
+    const failureCount = forwardResults.length - successCount;
+
+    console.log(`✅ Forwarding complete: ${successCount}/${forwardResults.length} successful`);
+
+    res.json({
+      success: successCount > 0,
+      message: `Processed ${forwardResults.length} records: ${successCount} successful, ${failureCount} failed`,
+      results: forwardResults,
+      summary: {
+        total: forwardResults.length,
+        successful: successCount,
+        failed: failureCount,
+        hours_back,
+        batch_size
+      }
+    });
+
+  } catch (error) {
+    console.error('Error in bulk forward operation:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to bulk forward monitoring data',
+      error: error.message
+    });
+  }
+});
+
+// Get pending records count (records not yet sent to external API)
+app.get('/api/v1/monitoring/pending-count', async (req, res) => {
+  try {
+    const { hours_back = 24 } = req.query;
+    
+    const query = `
+      SELECT 
+        COUNT(*) as total_records,
+        COUNT(CASE WHEN sent_to_external IS NULL OR sent_to_external = false THEN 1 END) as pending_records,
+        COUNT(CASE WHEN sent_to_external = true THEN 1 END) as sent_records,
+        COUNT(DISTINCT server_ip) as unique_servers
+      FROM sre_monitoring_data 
+      WHERE timestamp >= NOW() - INTERVAL '${hours_back} hours'
+    `;
+    
+    const result = await pool.query(query);
+    const stats = result.rows[0];
+    
+    res.json({
+      success: true,
+      stats: {
+        total_records: parseInt(stats.total_records),
+        pending_records: parseInt(stats.pending_records),
+        sent_records: parseInt(stats.sent_records),
+        unique_servers: parseInt(stats.unique_servers),
+        send_percentage: stats.total_records > 0 ? 
+          Math.round((stats.sent_records / stats.total_records) * 100) : 0
+      },
+      hours_back: parseInt(hours_back)
+    });
+
+  } catch (error) {
+    console.error('Error getting pending count:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get pending records count',
+      error: error.message
+    });
+  }
+});
+
+// Auto-forward endpoint (for scheduled jobs)
+app.post('/api/v1/monitoring/auto-forward', async (req, res) => {
+  try {
+    const { 
+      hours_back = 1,
+      max_records = 50,
+      dry_run = false 
+    } = req.body;
+
+    console.log(`🔄 Auto-forward job starting... (dry_run: ${dry_run})`);
+
+    if (dry_run) {
+      // Just count what would be sent
+      const countQuery = `
+        SELECT COUNT(*) as count
+        FROM sre_monitoring_data 
+        WHERE timestamp >= NOW() - INTERVAL '${hours_back} hours'
+          AND (sent_to_external IS NULL OR sent_to_external = false)
+      `;
+      
+      const countResult = await pool.query(countQuery);
+      const pendingCount = countResult.rows[0].count;
+
+      return res.json({
+        success: true,
+        dry_run: true,
+        message: `Would forward ${pendingCount} pending records`,
+        pending_count: parseInt(pendingCount)
+      });
+    }
+
+    // Actually forward the data
+    const forwardResponse = await axios.post(`${req.protocol}://${req.get('host')}/api/v1/monitoring/bulk-forward`, {
+      hours_back,
+      batch_size: max_records,
+      mark_as_sent: true
+    });
+
+    res.json({
+      success: true,
+      auto_forward: true,
+      ...forwardResponse.data
+    });
+
+  } catch (error) {
+    console.error('Error in auto-forward:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Auto-forward job failed',
+      error: error.message
+    });
+  }
+});
+
+// Get server statistics
+app.get('/api/v1/monitoring/stats', async (req, res) => {
+  try {
+    const { server_ip, hours_back = 24 } = req.query;
+
+    let whereClause = `WHERE timestamp >= NOW() - INTERVAL '${hours_back} hours'`;
+    const queryParams = [];
+    
+    if (server_ip) {
+      whereClause += ' AND server_ip = $1';
+      queryParams.push(server_ip);
+    }
+
+    const statsQuery = `
+      SELECT 
+        COUNT(*) as total_records,
+        AVG(cpu_usage_percentage) as avg_cpu_usage,
+        MAX(cpu_usage_percentage) as max_cpu_usage,
+        AVG(ram_used_percentage) as avg_ram_usage,
+        MAX(ram_used_percentage) as max_ram_usage,
+        COUNT(CASE WHEN mongodb_service_status = 'ACTIVE' THEN 1 END) as mongodb_active_count,
+        COUNT(CASE WHEN postgresql_service_status = 'ACTIVE' THEN 1 END) as postgresql_active_count,
+        COUNT(DISTINCT server_ip) as unique_servers,
+        MIN(timestamp) as earliest_record,
+        MAX(timestamp) as latest_record
+      FROM sre_monitoring_data 
+      ${whereClause}
+    `;
+
+    const result = await pool.query(statsQuery, queryParams);
+    
+    res.json({
+      success: true,
+      stats: {
+        ...result.rows[0],
+        avg_cpu_usage: parseFloat(result.rows[0].avg_cpu_usage || 0).toFixed(2),
+        avg_ram_usage: parseFloat(result.rows[0].avg_ram_usage || 0).toFixed(2)
+      },
+      period: `${hours_back} hours`,
+      server_ip: server_ip || 'all servers'
+    });
+
+  } catch (error) {
+    console.error('Error retrieving statistics:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to retrieve statistics',
+      error: error.message
+    });
+  }
+});
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({
+    success: false,
+    message: 'Internal server error',
+    error: process.env.NODE_ENV === 'production' ? 'Something went wrong' : error.message
+  });
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+  res.status(404).json({
+    success: false,
+    message: 'Endpoint not found'
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`🚀 SRE Monitoring Backend running on port ${PORT}`);
+  console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
+  console.log(`📝 Store data: POST http://localhost:${PORT}/api/v1/monitoring/store`);
+  console.log(`📖 Get data: GET http://localhost:${PORT}/api/v1/monitoring/data`);
+  console.log(`🔄 Forward data: POST http://localhost:${PORT}/api/v1/monitoring/forward`);
+  console.log(`📈 Statistics: GET http://localhost:${PORT}/api/v1/monitoring/stats`);
+});
