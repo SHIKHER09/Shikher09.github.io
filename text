@@ -1440,7 +1440,7 @@ app.post('/api/v1/monitoring/bulk-forward', async (req, res) => {
 
     // Forward records to external API
     const forwardResults = [];
-    const externalApiUrl = 'https://sre1.kfintech.com/SREScheduler/api/v1/MongoDB/MongoDBdata';
+    const externalApiUrl = '';
     
     for (const row of result.rows) {
       try {
