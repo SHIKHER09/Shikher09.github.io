@@ -213,38 +213,7 @@
 	<section class="s1">
 		<div class="main-container">
 			<h3 style="text-align:center;">Blog</h3>
-			<div class="post-wrapper">
-				<div>
-					<div class="post">
-						<img class="thumbnail" src="images/blog1.jpg" alt="Blog thumbnail 1">
-						<div class="post-preview">
-							<h6 class="post-title">Optimizing Postgres for Reliability</h6>
-							<p class="post-intro">Practical tips from my SRE/DB reliability work: backups, failover, and observability.</p>
-							<a target="_blank" href="/blog/postgres-reliability.html">Read More</a>
-						</div>
-					</div>
-				</div>
-				<div>
-					<div class="post">
-						<img class="thumbnail" src="images/blog2.jpg" alt="Blog thumbnail 2">
-						<div class="post-preview">
-							<h6 class="post-title">IaC in Small Teams: Ansible First</h6>
-							<p class="post-intro">Why Ansible is the best starting point for fast-moving teams.</p>
-							<a target="_blank" href="/blog/ansible-in-small-teams.html">Read More</a>
-						</div>
-					</div>
-				</div>
-				<div>
-					<div class="post">
-						<img class="thumbnail" src="images/blog3.jpg" alt="Blog thumbnail 3">
-						<div class="post-preview">
-							<h6 class="post-title">GitHub Pages + Decap CMS Guide</h6>
-							<p class="post-intro">A simple, zero-backend setup for a personal site with a blog.</p>
-							<a target="_blank" href="/blog/gh-pages-decap-guide.html">Read More</a>
-						</div>
-					</div>
-				</div>
-			</div>
+			<div id="blog-list" class="post-wrapper"></div>
 			<div style="text-align:center;" class="link"><a target="_blank" href="/blog/index.html">View all posts</a></div>
 		</div>
 	</section>
@@ -369,6 +338,127 @@
 			</form>
 		</div>
 	</section>
+
+	<script>
+		var typed = new Typed('#element', {
+			strings: ['Engineer', 'Powerlifter', 'Developer'],
+			typeSpeed: 100,
+		});
+	</script>
+	<script type="text/javascript" src="script.js"></script>
+  
+  <!-- Lightweight modal styles for Markdown reader -->
+  <style>
+    .modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;padding:16px;z-index:1000}
+    .modal.show{display:flex}
+    .modal-content{max-width:900px;width:100%;max-height:85vh;overflow:auto;background:#111;color:#eee;border-radius:12px;padding:24px;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+    .modal-close{position:absolute;top:12px;right:18px;font-size:22px;cursor:pointer}
+    .modal-content h1,.modal-content h2,.modal-content h3{color:#fff}
+    .post-meta{font-size:12px;opacity:.7;margin:4px 0 10px}
+    .btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid #444;text-decoration:none}
+  </style>
+
+  <!-- Markdown renderer -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
+  <!-- Blog manifest + renderer (Markdown files approach) -->
+  <script>
+    // 1) List your Markdown posts here. Each 'path' should point to a .md file in your repo.
+    const BLOG_POSTS = [
+      {
+        title: "Optimizing Postgres for Reliability",
+        date: "2025-08-12",
+        summary: "Backups, failover, xCluster notes, and observability checklists from DB/SRE work.",
+        path: "/blog/posts/postgres-reliability.md",
+        thumbnail: "images/blog1.jpg",
+        tags: ["Postgres","SRE","DB"]
+      },
+      {
+        title: "IaC in Small Teams: Ansible First",
+        date: "2025-07-04",
+        summary: "Start with Ansible before Terraform/K8s to deliver value quickly.",
+        path: "/blog/posts/ansible-in-small-teams.md",
+        thumbnail: "images/blog2.jpg",
+        tags: ["DevOps","Ansible","IaC"]
+      },
+      {
+        title: "GitHub Pages + Decap CMS Guide",
+        date: "2025-06-18",
+        summary: "Zero-backend personal site with Markdown posts and CMS preview.",
+        path: "/blog/posts/gh-pages-decap-guide.md",
+        thumbnail: "images/blog3.jpg",
+        tags: ["GitHub Pages","Decap","Blog"]
+      }
+    ];
+
+    // 2) Render compact blog cards on the homepage.
+    function renderBlogCards() {
+      const wrap = document.getElementById('blog-list');
+      if (!wrap) return;
+      wrap.innerHTML = '';
+      BLOG_POSTS.slice(0, 3).forEach(post => {
+        const card = document.createElement('div');
+        card.innerHTML = `
+          <div class="post">
+            <img class="thumbnail" src="${post.thumbnail}" alt="${post.title}">
+            <div class="post-preview">
+              <h6 class="post-title">${post.title}</h6>
+              <div class="post-meta">${new Date(post.date).toDateString()} • ${post.tags.join(' · ')}</div>
+              <p class="post-intro">${post.summary}</p>
+              <a href="#" class="btn" data-md="${post.path}">Read</a>
+            </div>
+          </div>`;
+        wrap.appendChild(card);
+      });
+
+      // Attach handlers for modal open
+      wrap.querySelectorAll('a[data-md]').forEach(a => {
+        a.addEventListener('click', async (e) => {
+          e.preventDefault();
+          const path = a.getAttribute('data-md');
+          try {
+            const md = await (await fetch(path)).text();
+            openMarkdownModal(md);
+          } catch (err) {
+            openMarkdownModal(`# Oops
+Unable to load the post.
+
+> Make sure **${path}** exists in your repo.`);
+          }
+        });
+      });
+    }
+
+    // 3) Simple modal Markdown reader
+    let modalEl;
+    function ensureModal() {
+      if (modalEl) return modalEl;
+      modalEl = document.createElement('div');
+      modalEl.className = 'modal';
+      modalEl.innerHTML = `
+        <div class="modal-content">
+          <span class="modal-close" title="Close">✕</span>
+          <div id="markdown-container"></div>
+        </div>`;
+      document.body.appendChild(modalEl);
+      modalEl.addEventListener('click', (e) => {
+        if (e.target.classList.contains('modal') || e.target.classList.contains('modal-close')) {
+          modalEl.classList.remove('show');
+        }
+      });
+      return modalEl;
+    }
+
+    function openMarkdownModal(markdownText) {
+      const m = ensureModal();
+      const container = m.querySelector('#markdown-container');
+      container.innerHTML = marked.parse(markdownText);
+      m.classList.add('show');
+    }
+
+    // Boot
+    document.addEventListener('DOMContentLoaded', renderBlogCards);
+  </script>
 
 	<script>
 		var typed = new Typed('#element', {
